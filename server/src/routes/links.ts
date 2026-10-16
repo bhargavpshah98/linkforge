@@ -4,6 +4,7 @@ import { z } from "zod";
 import { db } from "../db.js";
 import { fullReport, rangeSchema, resolveRange, topLinks, type Scope } from "../lib/analytics.js";
 import { hashPassword } from "../lib/auth.js";
+import { background } from "../lib/background.js";
 import { notFound } from "../lib/http.js";
 import {
   applyUtm,
@@ -21,8 +22,8 @@ import { emit } from "../lib/webhooks.js";
 /** Links + analytics. Mounted behind requireAuth. */
 export const linksRouter = Router();
 
-function ownedLink(req: Request) {
-  const row = getLinkById.get(String(req.params.id), req.user!.id);
+async function ownedLink(req: Request) {
+  const row = await getLinkById(String(req.params.id), req.user!.id);
   if (!row) throw notFound("Link not found");
   return row;
 }
@@ -46,10 +47,10 @@ const SORTS = {
   last_clicked: "last_clicked_at IS NULL, last_clicked_at DESC",
 } as const;
 
-linksRouter.get("/links", (req, res) => {
+linksRouter.get("/links", async (req, res) => {
   const q = listSchema.parse(req.query);
   const where = ["user_id = @userId"];
-  const params: Record<string, unknown> = { userId: req.user!.id };
+  const params: Record<string, string | number> = { userId: req.user!.id, now: new Date().toISOString() };
   if (q.q) {
     where.push("(code LIKE @q OR long_url LIKE @q OR title LIKE @q)");
     params.q = `%${q.q}%`;
@@ -58,30 +59,33 @@ linksRouter.get("/links", (req, res) => {
     where.push("EXISTS (SELECT 1 FROM json_each(links.tags) WHERE value = @tag)");
     params.tag = q.tag;
   }
-  const now = new Date().toISOString();
-  if (q.status === "active") where.push(`is_active = 1 AND (expires_at IS NULL OR expires_at > '${now}') AND (max_clicks IS NULL OR total_clicks < max_clicks)`);
+  if (q.status === "active") where.push("is_active = 1 AND (expires_at IS NULL OR expires_at > @now) AND (max_clicks IS NULL OR total_clicks < max_clicks)");
   if (q.status === "disabled") where.push("is_active = 0");
-  if (q.status === "expired") where.push(`(expires_at <= '${now}' OR total_clicks >= max_clicks)`);
+  if (q.status === "expired") where.push("(expires_at <= @now OR total_clicks >= max_clicks)");
   if (q.status === "protected") where.push("password_hash IS NOT NULL");
 
   const clause = where.join(" AND ");
-  const { total } = db.prepare(`SELECT COUNT(*) AS total FROM links WHERE ${clause}`).get(params) as { total: number };
-  const rows = db
-    .prepare(`SELECT * FROM links WHERE ${clause} ORDER BY ${SORTS[q.sort]} LIMIT @limit OFFSET @offset`)
-    .all({ ...params, limit: q.limit, offset: (q.page - 1) * q.limit }) as LinkRow[];
+  const [count, rows] = await Promise.all([
+    db.get<{ total: number }>(`SELECT COUNT(*) AS total FROM links WHERE ${clause}`, params),
+    db.all<LinkRow>(`SELECT * FROM links WHERE ${clause} ORDER BY ${SORTS[q.sort]} LIMIT @limit OFFSET @offset`, {
+      ...params,
+      limit: q.limit,
+      offset: (q.page - 1) * q.limit,
+    }),
+  ]);
+  const total = count!.total;
 
   // 14-day sparkline per link in one query.
-  const ids = rows.map((r) => r.id);
   const spark = new Map<string, number[]>();
-  if (ids.length) {
+  if (rows.length) {
     const since = new Date(Date.now() - 13 * 86_400_000);
     since.setUTCHours(0, 0, 0, 0);
-    const pts = db
-      .prepare(
-        `SELECT link_id, CAST(julianday(substr(ts, 1, 10)) - julianday(@since) AS INTEGER) AS d, COUNT(*) AS n FROM clicks
-         WHERE link_id IN (${ids.map(() => "?").join(",")}) AND ts >= @sinceIso AND is_bot = 0 GROUP BY link_id, d`,
-      )
-      .all(...ids, { since: since.toISOString().slice(0, 10), sinceIso: since.toISOString() }) as { link_id: string; d: number; n: number }[];
+    const ids = Object.fromEntries(rows.map((r, i) => [`id${i}`, r.id]));
+    const pts = await db.all<{ link_id: string; d: number; n: number }>(
+      `SELECT link_id, CAST(julianday(substr(ts, 1, 10)) - julianday(@since) AS INTEGER) AS d, COUNT(*) AS n FROM clicks
+       WHERE link_id IN (${Object.keys(ids).map((k) => `@${k}`).join(",")}) AND ts >= @sinceIso AND is_bot = 0 GROUP BY link_id, d`,
+      { ...ids, since: since.toISOString().slice(0, 10), sinceIso: since.toISOString() },
+    );
     for (const p of pts) {
       const arr = spark.get(p.link_id) ?? Array(14).fill(0);
       if (p.d >= 0 && p.d < 14) arr[p.d] = p.n;
@@ -98,7 +102,7 @@ linksRouter.get("/links", (req, res) => {
 linksRouter.post("/links", async (req, res) => {
   const input = createLinkSchema.parse(req.body);
   const link = serializeLink(await createLink(req.user!.id, input));
-  emit(req.user!.id, "link.created", link);
+  background(emit(req.user!.id, "link.created", link));
   res.status(201).json(link);
 });
 
@@ -113,7 +117,7 @@ linksRouter.post("/links/bulk", async (req, res) => {
     }
     try {
       const link = serializeLink(await createLink(req.user!.id, parsed.data));
-      emit(req.user!.id, "link.created", link);
+      background(emit(req.user!.id, "link.created", link));
       results.push({ index, ok: true, link });
     } catch (err) {
       results.push({ index, ok: false, error: err instanceof Error ? err.message : "Failed" });
@@ -122,25 +126,24 @@ linksRouter.post("/links/bulk", async (req, res) => {
   res.status(207).json({ created: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length, results });
 });
 
-linksRouter.get("/tags", (req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT j.value AS tag, COUNT(*) AS links FROM links, json_each(links.tags) j WHERE links.user_id = ? GROUP BY j.value ORDER BY links DESC, tag`,
-    )
-    .all(req.user!.id);
+linksRouter.get("/tags", async (req, res) => {
+  const rows = await db.all(
+    `SELECT j.value AS tag, COUNT(*) AS links FROM links, json_each(links.tags) j WHERE links.user_id = ? GROUP BY j.value ORDER BY links DESC, tag`,
+    [req.user!.id],
+  );
   res.json({ data: rows });
 });
 
 // ---- Single link ----
 
-linksRouter.get("/links/:id", (req, res) => {
-  res.json(serializeLink(ownedLink(req)));
+linksRouter.get("/links/:id", async (req, res) => {
+  res.json(serializeLink(await ownedLink(req)));
 });
 
 linksRouter.patch("/links/:id", async (req, res) => {
-  const link = ownedLink(req);
+  const link = await ownedLink(req);
   const body = updateLinkSchema.parse(req.body);
-  if (body.code && body.code !== link.code) assertCodeAvailable(body.code, link.id);
+  if (body.code && body.code !== link.code) await assertCodeAvailable(body.code, link.id);
 
   const next: Partial<LinkRow> = {};
   if (body.url !== undefined) next.long_url = applyUtm(body.url, body.utm);
@@ -158,24 +161,29 @@ linksRouter.patch("/links/:id", async (req, res) => {
 
   const keys = Object.keys(next);
   if (keys.length) {
-    db.prepare(
+    await db.run(
       `UPDATE links SET ${keys.map((k) => `${k} = @${k}`).join(", ")}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = @id`,
-    ).run({ ...next, id: link.id });
+      { ...(next as Record<string, string | number | null>), id: link.id },
+    );
   }
-  const updated = serializeLink(getLinkById.get(link.id, req.user!.id)!);
-  emit(req.user!.id, "link.updated", updated);
+  const updated = serializeLink((await getLinkById(link.id, req.user!.id))!);
+  background(emit(req.user!.id, "link.updated", updated));
   res.json(updated);
 });
 
-linksRouter.delete("/links/:id", (req, res) => {
-  const link = ownedLink(req);
-  db.prepare("DELETE FROM links WHERE id = ?").run(link.id);
-  emit(req.user!.id, "link.deleted", { id: link.id, code: link.code });
+linksRouter.delete("/links/:id", async (req, res) => {
+  const link = await ownedLink(req);
+  // Delete clicks explicitly: foreign-key cascades aren't guaranteed on every libSQL connection.
+  await db.batch([
+    { sql: "DELETE FROM clicks WHERE link_id = ?", args: [link.id] },
+    { sql: "DELETE FROM links WHERE id = ?", args: [link.id] },
+  ]);
+  background(emit(req.user!.id, "link.deleted", { id: link.id, code: link.code }));
   res.status(204).end();
 });
 
 linksRouter.get("/links/:id/qr", async (req, res) => {
-  const link = ownedLink(req);
+  const link = await ownedLink(req);
   const q = z
     .object({
       format: z.enum(["png", "svg"]).default("png"),
@@ -205,50 +213,65 @@ function scopeFrom(req: Request, linkId?: string) {
   return { scope, interval: r.interval, tzOffset: q.tz_offset ?? 0 };
 }
 
-linksRouter.get("/links/:id/analytics", (req, res) => {
-  const link = ownedLink(req);
+linksRouter.get("/links/:id/analytics", async (req, res) => {
+  const link = await ownedLink(req);
   const { scope, interval, tzOffset } = scopeFrom(req, link.id);
-  res.json({ link: serializeLink(link), ...fullReport(scope, interval, tzOffset) });
+  res.json({ link: serializeLink(link), ...(await fullReport(scope, interval, tzOffset)) });
 });
 
 const CLICK_COLUMNS = "ts, referrer, referrer_domain, country, city, device, browser, os, source, is_bot";
 
-linksRouter.get("/links/:id/clicks", (req, res) => {
-  const link = ownedLink(req);
+linksRouter.get("/links/:id/clicks", async (req, res) => {
+  const link = await ownedLink(req);
   const q = z
     .object({ page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(500).default(50) })
     .parse(req.query);
-  const { total } = db.prepare("SELECT COUNT(*) AS total FROM clicks WHERE link_id = ?").get(link.id) as { total: number };
-  const rows = db
-    .prepare(`SELECT ${CLICK_COLUMNS} FROM clicks WHERE link_id = ? ORDER BY ts DESC LIMIT ? OFFSET ?`)
-    .all(link.id, q.limit, (q.page - 1) * q.limit) as Record<string, unknown>[];
+  const [count, rows] = await Promise.all([
+    db.get<{ total: number }>("SELECT COUNT(*) AS total FROM clicks WHERE link_id = ?", [link.id]),
+    db.all<Record<string, unknown>>(`SELECT ${CLICK_COLUMNS} FROM clicks WHERE link_id = ? ORDER BY ts DESC LIMIT ? OFFSET ?`, [
+      link.id,
+      q.limit,
+      (q.page - 1) * q.limit,
+    ]),
+  ]);
+  const total = count!.total;
   res.json({
     data: rows.map((r) => ({ ...r, is_bot: Boolean(r.is_bot) })),
     pagination: { page: q.page, limit: q.limit, total, pages: Math.max(1, Math.ceil(total / q.limit)) },
   });
 });
 
-linksRouter.get("/links/:id/clicks.csv", (req, res) => {
-  const link = ownedLink(req);
+linksRouter.get("/links/:id/clicks.csv", async (req, res) => {
+  const link = await ownedLink(req);
   const esc = (v: unknown) => {
     const s = v == null ? "" : String(v);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   res.type("text/csv").setHeader("content-disposition", `attachment; filename="${link.code}-clicks.csv"`);
   res.write(CLICK_COLUMNS + "\n");
-  const stmt = db.prepare(`SELECT ${CLICK_COLUMNS} FROM clicks WHERE link_id = ? ORDER BY ts DESC`);
-  for (const row of stmt.iterate(link.id) as Iterable<Record<string, unknown>>) {
-    res.write(Object.values(row).map(esc).join(",") + "\n");
+  // Page through the click log so very large exports don't load into memory at once.
+  const PAGE = 5000;
+  for (let offset = 0; ; offset += PAGE) {
+    const rows = await db.all<Record<string, unknown>>(`SELECT ${CLICK_COLUMNS} FROM clicks WHERE link_id = ? ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`, [
+      link.id,
+      PAGE,
+      offset,
+    ]);
+    for (const row of rows) res.write(CLICK_COLUMNS.split(", ").map((c) => esc(row[c])).join(",") + "\n");
+    if (rows.length < PAGE) break;
   }
   res.end();
 });
 
-linksRouter.get("/analytics/overview", (req, res) => {
+linksRouter.get("/analytics/overview", async (req, res) => {
   const { scope, interval, tzOffset } = scopeFrom(req);
-  const counts = db
-    .prepare(
-      `SELECT COUNT(*) AS total_links, SUM(is_active) AS active_links, COALESCE(SUM(total_clicks), 0) AS lifetime_clicks FROM links WHERE user_id = ?`,
-    )
-    .get(req.user!.id);
-  res.json({ links: counts, ...fullReport(scope, interval, tzOffset), top_links: topLinks(scope, 10) });
+  const [counts, report, top] = await Promise.all([
+    db.get(
+      `SELECT COUNT(*) AS total_links, COALESCE(SUM(is_active), 0) AS active_links, COALESCE(SUM(total_clicks), 0) AS lifetime_clicks FROM links WHERE user_id = ?`,
+      [req.user!.id],
+    ),
+    fullReport(scope, interval, tzOffset),
+    topLinks(scope, 10),
+  ]);
+  res.json({ links: counts, ...report, top_links: top });
 });

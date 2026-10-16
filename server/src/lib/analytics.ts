@@ -85,17 +85,19 @@ function where(scope: Scope) {
   };
 }
 
-export function totals(scope: Scope) {
+export async function totals(scope: Scope) {
   const w = where(scope);
-  const row = db
-    .prepare(`SELECT COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors ${w.sql}`)
-    .get(w.params) as { clicks: number; unique_visitors: number };
   // Same-length window immediately before, for the "vs previous period" delta.
   const span = scope.to.getTime() - scope.from.getTime();
   const pw = where({ ...scope, from: new Date(scope.from.getTime() - span), to: new Date(scope.from.getTime() - 1) });
-  const prev = db.prepare(`SELECT COUNT(*) AS clicks ${pw.sql}`).get(pw.params) as { clicks: number };
-  const qr = db.prepare(`SELECT COUNT(*) AS n ${w.sql} AND c.source = 'qr'`).get(w.params) as { n: number };
-  return { ...row, qr_scans: qr.n, previous_clicks: prev.clicks };
+  const [row, prev] = await Promise.all([
+    db.get<{ clicks: number; unique_visitors: number; qr_scans: number | null }>(
+      `SELECT COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors, SUM(c.source = 'qr') AS qr_scans ${w.sql}`,
+      w.params,
+    ),
+    db.get<{ clicks: number }>(`SELECT COUNT(*) AS clicks ${pw.sql}`, pw.params),
+  ]);
+  return { clicks: row!.clicks, unique_visitors: row!.unique_visitors, qr_scans: row!.qr_scans ?? 0, previous_clicks: prev!.clicks };
 }
 
 function bucketKeys(from: Date, to: Date, interval: Interval) {
@@ -117,14 +119,13 @@ function bucketKeys(from: Date, to: Date, interval: Interval) {
 }
 
 /** Clicks per bucket, zero-filled so charts never have gaps. */
-export function timeseries(scope: Scope, interval: Interval) {
+export async function timeseries(scope: Scope, interval: Interval) {
   const w = where(scope);
-  const rows = db
-    .prepare(
-      `SELECT ${INTERVAL_FORMAT[interval]} AS bucket, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
-       ${w.sql} GROUP BY bucket`,
-    )
-    .all(w.params) as { bucket: string; clicks: number; unique_visitors: number }[];
+  const rows = await db.all<{ bucket: string; clicks: number; unique_visitors: number }>(
+    `SELECT ${INTERVAL_FORMAT[interval]} AS bucket, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
+     ${w.sql} GROUP BY bucket`,
+    w.params,
+  );
   const byKey = new Map(rows.map((r) => [r.bucket, r]));
   return bucketKeys(scope.from, scope.to, interval).map((key) => ({
     date: key,
@@ -136,25 +137,23 @@ export function timeseries(scope: Scope, interval: Interval) {
 export function breakdown(scope: Scope, dimension: Dimension, limit = 10) {
   const w = where(scope);
   const column = DIMENSIONS[dimension];
-  return db
-    .prepare(
-      `SELECT COALESCE(${column}, 'Unknown') AS value, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
-       ${w.sql} GROUP BY value ORDER BY clicks DESC LIMIT @limit`,
-    )
-    .all({ ...w.params, limit }) as { value: string; clicks: number; unique_visitors: number }[];
+  return db.all<{ value: string; clicks: number; unique_visitors: number }>(
+    `SELECT COALESCE(${column}, 'Unknown') AS value, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
+     ${w.sql} GROUP BY value ORDER BY clicks DESC LIMIT @limit`,
+    { ...w.params, limit },
+  );
 }
 
 /** 7 x 24 grid of clicks by weekday (0 = Monday) and hour, shifted to the viewer's timezone. */
-export function heatmap(scope: Scope, tzOffsetMinutes = 0) {
+export async function heatmap(scope: Scope, tzOffsetMinutes = 0) {
   const w = where(scope);
   const shift = `'${-tzOffsetMinutes} minutes'`;
-  const rows = db
-    .prepare(
-      `SELECT (CAST(strftime('%w', c.ts, ${shift}) AS INTEGER) + 6) % 7 AS weekday,
-              CAST(strftime('%H', c.ts, ${shift}) AS INTEGER) AS hour, COUNT(*) AS clicks
-       ${w.sql} GROUP BY weekday, hour`,
-    )
-    .all(w.params) as { weekday: number; hour: number; clicks: number }[];
+  const rows = await db.all<{ weekday: number; hour: number; clicks: number }>(
+    `SELECT (CAST(strftime('%w', c.ts, ${shift}) AS INTEGER) + 6) % 7 AS weekday,
+            CAST(strftime('%H', c.ts, ${shift}) AS INTEGER) AS hour, COUNT(*) AS clicks
+     ${w.sql} GROUP BY weekday, hour`,
+    w.params,
+  );
   const grid = Array.from({ length: 7 }, () => Array(24).fill(0) as number[]);
   for (const r of rows) grid[r.weekday][r.hour] = r.clicks;
   return grid;
@@ -162,27 +161,39 @@ export function heatmap(scope: Scope, tzOffsetMinutes = 0) {
 
 export function topLinks(scope: Scope, limit = 10) {
   const w = where(scope);
-  return db
-    .prepare(
-      `SELECT l.id, l.code, l.title, l.long_url, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
-       ${w.sql} GROUP BY l.id ORDER BY clicks DESC LIMIT @limit`,
-    )
-    .all({ ...w.params, limit }) as { id: string; code: string; title: string | null; long_url: string; clicks: number; unique_visitors: number }[];
+  return db.all<{ id: string; code: string; title: string | null; long_url: string; clicks: number; unique_visitors: number }>(
+    `SELECT l.id, l.code, l.title, l.long_url, COUNT(*) AS clicks, COUNT(DISTINCT c.visitor_hash) AS unique_visitors
+     ${w.sql} GROUP BY l.id ORDER BY clicks DESC LIMIT @limit`,
+    { ...w.params, limit },
+  );
 }
 
-export function fullReport(scope: Scope, interval: Interval, tzOffset = 0) {
+/** Every section of the report, queried in parallel (each query is a round trip when the DB is remote). */
+export async function fullReport(scope: Scope, interval: Interval, tzOffset = 0) {
+  const [t, series, referrers, countries, cities, devices, browsers, os, sources, grid] = await Promise.all([
+    totals(scope),
+    timeseries(scope, interval),
+    breakdown(scope, "referrers"),
+    breakdown(scope, "countries", 250),
+    breakdown(scope, "cities"),
+    breakdown(scope, "devices"),
+    breakdown(scope, "browsers"),
+    breakdown(scope, "os"),
+    breakdown(scope, "sources"),
+    heatmap(scope, tzOffset),
+  ]);
   return {
     range: { from: scope.from.toISOString(), to: scope.to.toISOString(), interval },
     filters: scope.filters ?? {},
-    totals: totals(scope),
-    timeseries: timeseries(scope, interval),
-    referrers: breakdown(scope, "referrers"),
-    countries: breakdown(scope, "countries", 250),
-    cities: breakdown(scope, "cities"),
-    devices: breakdown(scope, "devices"),
-    browsers: breakdown(scope, "browsers"),
-    os: breakdown(scope, "os"),
-    sources: breakdown(scope, "sources"),
-    heatmap: heatmap(scope, tzOffset),
+    totals: t,
+    timeseries: series,
+    referrers,
+    countries,
+    cities,
+    devices,
+    browsers,
+    os,
+    sources,
+    heatmap: grid,
   };
 }

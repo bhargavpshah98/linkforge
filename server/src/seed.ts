@@ -51,14 +51,36 @@ const LINKS = [
 ];
 
 async function main() {
-  const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(EMAIL) as { id: string } | undefined;
-  if (existing) db.prepare("DELETE FROM users WHERE id = ?").run(existing.id);
+  const existing = await db.get<{ id: string }>("SELECT id FROM users WHERE email = ?", [EMAIL]);
+  if (existing) {
+    const owned = "SELECT id FROM links WHERE user_id = ?";
+    await db.batch([
+      { sql: `DELETE FROM clicks WHERE link_id IN (${owned})`, args: [existing.id] },
+      { sql: "DELETE FROM links WHERE user_id = ?", args: [existing.id] },
+      { sql: "DELETE FROM api_keys WHERE user_id = ?", args: [existing.id] },
+      { sql: "DELETE FROM webhooks WHERE user_id = ?", args: [existing.id] },
+      { sql: "DELETE FROM users WHERE id = ?", args: [existing.id] },
+    ]);
+  }
 
   const userId = newId();
-  db.prepare("INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)").run(userId, EMAIL, "Demo User", await hashPassword(PASSWORD));
+  await db.run("INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)", [userId, EMAIL, "Demo User", await hashPassword(PASSWORD)]);
 
-  const insertClick = db.prepare(`INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, device, browser, os, source, is_bot)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  // Multi-row INSERTs: one round trip per 200 clicks instead of one per click (matters against a remote DB).
+  type Click = (string | number | null)[];
+  async function insertClicks(rows: Click[]) {
+    const CHUNK = 200;
+    const statements = [];
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK);
+      statements.push({
+        sql: `INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, device, browser, os, source, is_bot)
+              VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ")}`,
+        args: chunk.flat(),
+      });
+    }
+    if (statements.length) await db.batch(statements);
+  }
   const DAY = 86_400_000;
   const now = Date.now();
   let totalClicks = 0;
@@ -67,14 +89,15 @@ async function main() {
     const { weight, qrHeavy, ...input } = spec;
     const link = await createLink(userId, createLinkSchema.parse(input));
     const ageDays = 90 - i * 4;
-    db.prepare("UPDATE links SET created_at = ? WHERE id = ?").run(new Date(now - ageDays * DAY).toISOString(), link.id);
+    await db.run("UPDATE links SET created_at = ? WHERE id = ?", [new Date(now - ageDays * DAY).toISOString(), link.id]);
     const expiresAt = spec.expires_at ? new Date(spec.expires_at).getTime() : Infinity;
 
     // Each link trends differently: some grow, some fade.
     const trend = (Math.random() < 0.3 ? -1 : 1) * (60 + Math.random() * 180);
     const visitors = Array.from({ length: weight * 25 }, (_, n) => sha256(`${link.id}-${n}`).slice(0, 32));
     let count = 0;
-    db.transaction(() => {
+    const clicks: Click[] = [];
+    {
       for (let d = ageDays; d >= 0; d--) {
         const dayStart = now - d * DAY;
         if (dayStart > expiresAt) break;
@@ -93,21 +116,22 @@ async function main() {
           const [country, city] = weighted(PLACES);
           const [device, browser, os] = weighted(CLIENTS);
           const isBot = Math.random() < 0.03;
-          insertClick.run(
+          clicks.push([
             link.id, ts.toISOString(), visitors[Math.floor(Math.random() * visitors.length)], ref,
             ref ? new URL(ref).hostname.replace(/^www\./, "") : "Direct", country, city || null,
             device, browser, os, qrHeavy || Math.random() < 0.06 ? "qr" : "link", Number(isBot),
-          );
+          ]);
           if (!isBot) count++;
         }
       }
-      db.prepare("UPDATE links SET total_clicks = ?, last_clicked_at = (SELECT MAX(ts) FROM clicks WHERE link_id = ?) WHERE id = ?").run(count, link.id, link.id);
-    })();
+    }
+    await insertClicks(clicks);
+    await db.run("UPDATE links SET total_clicks = ?, last_clicked_at = (SELECT MAX(ts) FROM clicks WHERE link_id = ?) WHERE id = ?", [count, link.id, link.id]);
     totalClicks += count;
   }
 
   const { key, prefix, hash } = generateApiKey();
-  db.prepare("INSERT INTO api_keys (id, user_id, name, prefix, key_hash) VALUES (?, ?, ?, ?, ?)").run(newId(), userId, "Seeded demo key", prefix, hash);
+  await db.run("INSERT INTO api_keys (id, user_id, name, prefix, key_hash) VALUES (?, ?, ?, ?, ?)", [newId(), userId, "Seeded demo key", prefix, hash]);
 
   console.log(`Seeded ${LINKS.length} links and ${totalClicks.toLocaleString()} clicks.`);
   console.log(`  Login:   ${EMAIL} / ${PASSWORD}`);

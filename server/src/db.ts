@@ -1,9 +1,7 @@
-import Database from "better-sqlite3";
+import { createClient, type InArgs, type InStatement } from "@libsql/client";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config.js";
-
-export type DB = Database.Database;
 
 // Each entry runs once, in order. Append new migrations; never edit old ones.
 const migrations: string[] = [
@@ -80,24 +78,77 @@ const migrations: string[] = [
   `,
 ];
 
-export function openDb(file = config.databasePath): DB {
-  if (file !== ":memory:") fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  const db = new Database(file);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma("busy_timeout = 5000");
-  migrate(db);
-  return db;
+/**
+ * DATABASE_URL picks the backend:
+ *   - a file path or "file:..."       -> local SQLite file (development, Docker)
+ *   - ":memory:"                      -> throwaway in-memory database (tests)
+ *   - "libsql://...turso.io" + token  -> Turso, hosted SQLite (serverless deployments)
+ */
+function connectionUrl() {
+  const url = config.databaseUrl;
+  if (url === ":memory:" || /^(libsql|https?|wss?|file):/.test(url)) return url;
+  fs.mkdirSync(path.dirname(path.resolve(url)), { recursive: true });
+  return `file:${url}`;
 }
 
-function migrate(db: DB) {
-  const current = db.pragma("user_version", { simple: true }) as number;
+const client = createClient({ url: connectionUrl(), authToken: config.databaseAuthToken });
+
+const split = (sql: string) =>
+  sql
+    .split(/;\s*\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+async function migrate() {
+  if (config.databaseUrl !== ":memory:" && !/^(libsql|https?|wss?):/.test(config.databaseUrl)) {
+    await client.execute("PRAGMA journal_mode = WAL");
+  }
+  await client.execute("PRAGMA foreign_keys = ON");
+  await client.execute("CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");
+  const done = await client.execute("SELECT COALESCE(MAX(version), 0) AS v FROM _migrations");
+  let current = Number(done.rows[0].v);
+  if (current === 0) {
+    // Databases created before the _migrations table tracked their version in PRAGMA user_version.
+    const legacy = Number((await client.execute("PRAGMA user_version")).rows[0]?.user_version ?? 0);
+    for (let v = 1; v <= legacy; v++) {
+      await client.execute({ sql: "INSERT INTO _migrations (version, applied_at) VALUES (?, ?)", args: [v, new Date().toISOString()] });
+    }
+    current = legacy;
+  }
   for (let i = current; i < migrations.length; i++) {
-    db.transaction(() => {
-      db.exec(migrations[i]);
-      db.pragma(`user_version = ${i + 1}`);
-    })();
+    await client.batch(
+      [...split(migrations[i]), { sql: "INSERT INTO _migrations (version, applied_at) VALUES (?, ?)", args: [i + 1, new Date().toISOString()] }],
+      "write",
+    );
   }
 }
 
-export const db = openDb();
+/** Resolves once the schema is up to date. Every query waits on it, so callers never race a cold start. */
+export const ready = migrate();
+
+type Row = Record<string, unknown>;
+
+async function exec(sql: string, args?: InArgs) {
+  await ready;
+  return client.execute(args === undefined ? sql : { sql, args });
+}
+
+/** Thin promise-based query helpers over libSQL. Named params use `@name`, positional use `?`. */
+export const db = {
+  async all<T = Row>(sql: string, args?: InArgs): Promise<T[]> {
+    return (await exec(sql, args)).rows as unknown as T[];
+  },
+  async get<T = Row>(sql: string, args?: InArgs): Promise<T | undefined> {
+    return (await exec(sql, args)).rows[0] as unknown as T | undefined;
+  },
+  async run(sql: string, args?: InArgs) {
+    const rs = await exec(sql, args);
+    return { changes: rs.rowsAffected };
+  },
+  /** Runs statements atomically (all or nothing). */
+  async batch(statements: InStatement[]) {
+    await ready;
+    return client.batch(statements, "write");
+  },
+  close: () => client.close(),
+};

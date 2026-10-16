@@ -11,7 +11,7 @@ RUN npm run build && npm prune --omit=dev
 
 # ---- runtime: just node, production deps and built files ----
 FROM node:22-bookworm-slim
-ENV NODE_ENV=production PORT=4000 DATABASE_PATH=/data/linkforge.db TRUST_PROXY=1
+ENV NODE_ENV=production PORT=4000 DATABASE_URL=/data/linkforge.db TRUST_PROXY=1
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./

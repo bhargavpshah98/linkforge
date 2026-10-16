@@ -125,23 +125,22 @@ export function serializeLink(row: LinkRow) {
   };
 }
 
-const codeTaken = db.prepare<[string], { id: string }>("SELECT id FROM links WHERE code = ?");
-const insertLink = db.prepare(`
-  INSERT INTO links (id, user_id, code, long_url, title, tags, password_hash, expires_at, max_clicks, redirect_type, ios_url, android_url)
-  VALUES (@id, @user_id, @code, @long_url, @title, @tags, @password_hash, @expires_at, @max_clicks, @redirect_type, @ios_url, @android_url)
-`);
-export const getLinkById = db.prepare<[string, string], LinkRow>("SELECT * FROM links WHERE id = ? AND user_id = ?");
+export function getLinkById(id: string, userId: string) {
+  return db.get<LinkRow>("SELECT * FROM links WHERE id = ? AND user_id = ?", [id, userId]);
+}
 
-export function assertCodeAvailable(code: string, exceptId?: string) {
+const codeOwner = (code: string) => db.get<{ id: string }>("SELECT id FROM links WHERE code = ?", [code]);
+
+export async function assertCodeAvailable(code: string, exceptId?: string) {
   if (isReserved(code)) throw badRequest(`"${code}" is a reserved word and cannot be used as a back-half`);
-  const hit = codeTaken.get(code);
+  const hit = await codeOwner(code);
   if (hit && hit.id !== exceptId) throw conflict(`The back-half "${code}" is already taken`);
 }
 
-function uniqueCode() {
+async function uniqueCode() {
   for (let attempt = 0; attempt < 8; attempt++) {
     const code = newCode();
-    if (!codeTaken.get(code)) return code;
+    if (!(await codeOwner(code))) return code;
   }
   throw new Error("Could not generate a unique short code; increase CODE_LENGTH");
 }
@@ -152,26 +151,36 @@ export async function createLink(userId: string, input: CreateLinkInput): Promis
 
   let code: string;
   if (input.custom_code) {
-    assertCodeAvailable(input.custom_code);
+    await assertCodeAvailable(input.custom_code);
     code = input.custom_code;
   } else {
-    code = uniqueCode();
+    code = await uniqueCode();
   }
 
   const id = newId();
-  insertLink.run({
-    id,
-    user_id: userId,
-    code,
-    long_url: longUrl,
-    title: input.title || null,
-    tags: JSON.stringify([...new Set(input.tags ?? [])]),
-    password_hash: input.password ? await hashPassword(input.password) : null,
-    expires_at: input.expires_at ?? null,
-    max_clicks: input.max_clicks ?? null,
-    redirect_type: input.redirect_type ?? 302,
-    ios_url: input.ios_url ?? null,
-    android_url: input.android_url ?? null,
-  });
-  return getLinkById.get(id, userId)!;
+  try {
+    await db.run(
+      `INSERT INTO links (id, user_id, code, long_url, title, tags, password_hash, expires_at, max_clicks, redirect_type, ios_url, android_url)
+       VALUES (@id, @user_id, @code, @long_url, @title, @tags, @password_hash, @expires_at, @max_clicks, @redirect_type, @ios_url, @android_url)`,
+      {
+        id,
+        user_id: userId,
+        code,
+        long_url: longUrl,
+        title: input.title || null,
+        tags: JSON.stringify([...new Set(input.tags ?? [])]),
+        password_hash: input.password ? await hashPassword(input.password) : null,
+        expires_at: input.expires_at ?? null,
+        max_clicks: input.max_clicks ?? null,
+        redirect_type: input.redirect_type ?? 302,
+        ios_url: input.ios_url ?? null,
+        android_url: input.android_url ?? null,
+      },
+    );
+  } catch (err) {
+    // Two requests raced for the same back-half: the UNIQUE index caught it.
+    if (String(err).includes("UNIQUE constraint failed: links.code")) throw conflict(`The back-half "${code}" is already taken`);
+    throw err;
+  }
+  return (await getLinkById(id, userId))!;
 }

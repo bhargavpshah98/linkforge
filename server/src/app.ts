@@ -17,7 +17,8 @@ import { redirectRouter } from "./routes/redirect.js";
 export function createApp() {
   const app = express();
   app.disable("x-powered-by");
-  if (config.trustProxy) app.set("trust proxy", true);
+  // Trust exactly one proxy hop (the platform's load balancer) so req.ip is the visitor, not the proxy.
+  if (config.trustProxy) app.set("trust proxy", 1);
 
   app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: "cross-origin" } }));
   app.use(express.json({ limit: "1mb" }));

@@ -4,18 +4,14 @@ import rateLimit from "express-rate-limit";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import { verifyPassword } from "../lib/auth.js";
+import { background } from "../lib/background.js";
 import { linkStatus, serializeLink, shortUrl, type LinkRow } from "../lib/links.js";
 import { describeClick, destinationFor } from "../lib/tracking.js";
 import { emit } from "../lib/webhooks.js";
 
 export const redirectRouter = Router();
 
-const findByCode = db.prepare<[string], LinkRow>("SELECT * FROM links WHERE code = ?");
-const insertClick = db.prepare(`
-  INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, device, browser, os, source, is_bot)
-  VALUES (@link_id, @ts, @visitor_hash, @referrer, @referrer_domain, @country, @city, @device, @browser, @os, @source, @is_bot)
-`);
-const bumpCount = db.prepare("UPDATE links SET total_clicks = total_clicks + 1, last_clicked_at = ? WHERE id = ?");
+const findByCode = (code: string) => db.get<LinkRow>("SELECT * FROM links WHERE code = ?", [code]);
 
 const escapeHtml = (s: string) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
@@ -64,34 +60,41 @@ function passwordPage(req: Request, res: Response, code: string, error?: string)
   );
 }
 
-function recordAndRedirect(req: Request, res: Response, link: LinkRow) {
+async function recordAndRedirect(req: Request, res: Response, link: LinkRow) {
   const info = describeClick(req);
   const ts = new Date().toISOString();
   const source = req.query.qr === "1" ? "qr" : "link";
-  db.transaction(() => {
-    insertClick.run({
-      link_id: link.id,
-      ts,
-      visitor_hash: info.visitorHash,
-      referrer: info.referrer,
-      referrer_domain: info.referrerDomain,
-      country: info.country,
-      city: info.city,
-      device: info.device,
-      browser: info.browser,
-      os: info.os,
-      source,
-      is_bot: Number(info.isBot),
-    });
+  const click = {
+    link_id: link.id,
+    ts,
+    visitor_hash: info.visitorHash,
+    referrer: info.referrer,
+    referrer_domain: info.referrerDomain,
+    country: info.country,
+    city: info.city,
+    device: info.device,
+    browser: info.browser,
+    os: info.os,
+    source,
+    is_bot: Number(info.isBot),
+  };
+  await db.batch([
+    {
+      sql: `INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, device, browser, os, source, is_bot)
+            VALUES (@link_id, @ts, @visitor_hash, @referrer, @referrer_domain, @country, @city, @device, @browser, @os, @source, @is_bot)`,
+      args: click,
+    },
     // Bots are stored for transparency but don't count toward totals or click limits.
-    if (!info.isBot) bumpCount.run(ts, link.id);
-  })();
+    ...(info.isBot ? [] : [{ sql: "UPDATE links SET total_clicks = total_clicks + 1, last_clicked_at = ? WHERE id = ?", args: [ts, link.id] }]),
+  ]);
 
   if (!info.isBot) {
-    emit(link.user_id, "link.clicked", {
-      link: { id: link.id, code: link.code, short_url: shortUrl(link.code), long_url: link.long_url },
-      click: { ts, country: info.country, city: info.city, device: info.device, browser: info.browser, os: info.os, referrer: info.referrerDomain, source },
-    });
+    background(
+      emit(link.user_id, "link.clicked", {
+        link: { id: link.id, code: link.code, short_url: shortUrl(link.code), long_url: link.long_url },
+        click: { ts, country: info.country, city: info.city, device: info.device, browser: info.browser, os: info.os, referrer: info.referrerDomain, source },
+      }),
+    );
   }
 
   // 302s are never cached by browsers, so every visit is counted. 301s may be cached (better for SEO, worse for analytics).
@@ -100,14 +103,14 @@ function recordAndRedirect(req: Request, res: Response, link: LinkRow) {
   res.redirect(req.method === "POST" ? 303 : link.redirect_type, destinationFor(link, info.os));
 }
 
-function lookup(req: Request) {
+async function lookup(req: Request) {
   const raw = String(req.params.code);
   const preview = raw.endsWith("+");
-  return { preview, link: findByCode.get(preview ? raw.slice(0, -1) : raw) };
+  return { preview, link: await findByCode(preview ? raw.slice(0, -1) : raw) };
 }
 
-redirectRouter.get("/:code", (req, res) => {
-  const { preview, link } = lookup(req);
+redirectRouter.get("/:code", async (req, res) => {
+  const { preview, link } = await lookup(req);
   if (!link) return notFoundPage(res);
 
   // Like bit.ly: appending "+" shows where a link goes instead of following it.
@@ -127,18 +130,18 @@ redirectRouter.get("/:code", (req, res) => {
   const status = linkStatus(link);
   if (status !== "active") return unavailablePage(res, status);
   if (link.password_hash) return passwordPage(req, res, link.code);
-  recordAndRedirect(req, res, link);
+  await recordAndRedirect(req, res, link);
 });
 
 const passwordLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, skip: () => config.env === "test" });
 
 redirectRouter.post("/:code", passwordLimiter, express.urlencoded({ extended: false }), async (req, res) => {
-  const { link } = lookup(req);
+  const { link } = await lookup(req);
   if (!link) return notFoundPage(res);
   const status = linkStatus(link);
   if (status !== "active") return unavailablePage(res, status);
-  if (!link.password_hash) return recordAndRedirect(req, res, link);
+  if (!link.password_hash) return await recordAndRedirect(req, res, link);
   const password = typeof req.body?.password === "string" ? req.body.password : "";
   if (!(await verifyPassword(password, link.password_hash))) return passwordPage(req, res, link.code, "Incorrect password");
-  recordAndRedirect(req, res, link);
+  await recordAndRedirect(req, res, link);
 });

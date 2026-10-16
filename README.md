@@ -1,6 +1,6 @@
 # LinkForge
 
-**A self-hostable URL shortener with real-time click analytics, QR codes, a REST API, webhooks and an interactive dashboard.** Think bit.ly's paid tier (custom back-halves, link analytics, QR codes, API, UTM builder, password-protected and expiring links, device targeting) that you run yourself, as one Node.js process with one SQLite file.
+**A self-hostable URL shortener with real-time click analytics, QR codes, a REST API, webhooks and an interactive dashboard.** Think bit.ly's paid tier (custom back-halves, link analytics, QR codes, API, UTM builder, password-protected and expiring links, device targeting) that you run yourself, as one Node.js process backed by SQLite: a local file on your own server, or [Turso](https://turso.tech) (hosted SQLite) on serverless platforms like Vercel.
 
 ![Overview dashboard](docs/screenshots/overview.png)
 
@@ -235,7 +235,7 @@ linkforge/
 
 **Tech choices and why:**
 
-- **SQLite (better-sqlite3, WAL mode)**: no database server to install. Synchronous writes take microseconds, which suits a redirect hot path, and the whole database is one file you can back up. It handles thousands of redirects per second on one machine.
+- **SQLite via libSQL (`@libsql/client`)**: the same code talks to a local SQLite file (development, Docker, a VPS) or to [Turso](https://turso.tech), hosted SQLite, on serverless platforms. Nothing to install locally, and the whole local database is one file you can back up. Report queries run in parallel, so a remote database stays fast.
 - **Express 5**: catches errors thrown in async handlers natively, with no extra wrapper.
 - **zod**: every request body and query string is validated, and failures come back as a uniform `validation_error`.
 - **TanStack Query** in the dashboard: caching, background refetching (live counters), and keeping the previous data on screen while filters change so the page doesn't flicker.
@@ -298,7 +298,7 @@ erDiagram
             int last_status }
 ```
 
-`links.total_clicks` is a **denormalized counter**, updated in the same transaction as the click insert. The links list and click limits read it directly instead of counting rows. Schema changes live in `server/src/db.ts` as an append-only list of migrations, tracked with SQLite's `user_version`.
+`links.total_clicks` is a **denormalized counter**, updated in the same transaction as the click insert. The links list and click limits read it directly instead of counting rows. Schema changes live in `server/src/db.ts` as an append-only list of migrations, tracked in a `_migrations` table. They run automatically on startup.
 
 ---
 
@@ -512,12 +512,13 @@ All settings are environment variables (see `server/.env.example`).
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4000` | HTTP port |
-| `BASE_URL` | `http://localhost:4000` | Public origin used to build short links and QR codes. **Set this to your short domain in production.** |
+| `BASE_URL` | `http://localhost:4000` | Public origin used to build short links and QR codes. **Set this to your short domain in production.** On Vercel it defaults to the project's production domain. |
 | `APP_URL` | `http://localhost:5173` | Dashboard URL (used in links from the 404 page). The same as `BASE_URL` in production. |
-| `DATABASE_PATH` | `./data/linkforge.db` | SQLite file (`:memory:` for throwaway runs) |
+| `DATABASE_URL` | `./data/linkforge.db` | A local file path, `:memory:` for throwaway runs, or a Turso URL `libsql://<db>-<org>.turso.io`. `TURSO_DATABASE_URL` and the older `DATABASE_PATH` also work. |
+| `DATABASE_AUTH_TOKEN` | | Turso auth token (or `TURSO_AUTH_TOKEN`). Only needed for Turso. |
 | `JWT_SECRET` | dev value | **Required in production.** Signs dashboard sessions. |
-| `IP_HASH_SALT` | dev value | Salt for visitor hashes. Set a random value. |
-| `TRUST_PROXY` | `0` | Set to `1` behind a load balancer or reverse proxy so the real client IP is used |
+| `IP_HASH_SALT` | `JWT_SECRET` | Salt for visitor hashes |
+| `TRUST_PROXY` | `0` (`1` on Vercel) | Set to `1` behind a load balancer or reverse proxy so the real client IP is used |
 | `CODE_LENGTH` | `7` | Length of generated codes |
 | `WEB_DIST` | `../web/dist` | Where the built dashboard lives |
 
@@ -527,9 +528,30 @@ All settings are environment variables (see `server/.env.example`).
 
 ## Deployment
 
-In production **one Node process** serves the API, the dashboard (built static files) and the redirects on a single port and domain.
+Pick one of two shapes:
 
-### Option A: Docker (recommended)
+- **Serverless (free): Vercel + Turso.** Vercel serves the dashboard as static files and runs the API and redirects as one function. Turso stores the data.
+- **One long-running server: Docker or plain Node.** One process serves everything on one port and keeps the data in a local SQLite file.
+
+### Option A: Vercel + Turso (free)
+
+Both free plans are enough for a personal shortener: Turso's includes 5 GB of storage and 500M row reads per month, Vercel Hobby is free for non-commercial use, and nothing sleeps.
+
+1. **Create the database.** Sign up at [turso.tech](https://turso.tech), create a database in the region closest to Vercel's default (`aws-us-east-1`), then copy its **URL** (`libsql://...`) and create a **token**.
+2. **Import the repo into Vercel.** On [vercel.com/new](https://vercel.com/new), import this GitHub repo. `vercel.json` already sets the build. Leave the framework as "Other".
+3. **Add environment variables** (Project → Settings → Environment Variables):
+
+   | Name | Value |
+   |---|---|
+   | `TURSO_DATABASE_URL` | `libsql://<db>-<org>.turso.io` |
+   | `TURSO_AUTH_TOKEN` | the token from step 1 |
+   | `JWT_SECRET` | a long random string, e.g. `openssl rand -hex 32` |
+
+4. **Deploy.** Tables are created on the first request. Short links use `https://<project>.vercel.app/<code>` automatically. Set `BASE_URL` only if you add a custom domain.
+
+How it's wired: `vercel.json` serves `web/dist` as static files, sends `/app/*`, `/login` and `/register` to the dashboard's `index.html`, and rewrites everything else (`/api/*` and `/<code>`) to `api/index.js`, which exports the same Express app. Webhook deliveries use Vercel's `waitUntil` so they finish after the redirect has been sent.
+
+### Option B: Docker
 
 ```bash
 # .env next to docker-compose.yml
@@ -542,7 +564,7 @@ docker compose up -d --build
 
 The SQLite database lives in the `linkforge-data` volume. The image runs as a non-root user and has a health check on `/api/health`.
 
-### Option B: Plain Node
+### Option C: Plain Node
 
 ```bash
 npm ci
@@ -554,9 +576,9 @@ npm start
 
 Keep it running with systemd or pm2, behind Nginx or Caddy for TLS.
 
-### Option C: Managed platforms
+### Option D: Other container platforms
 
-Any platform that runs a Docker image **with a persistent disk** works:
+Any platform that runs a Docker image **with a persistent disk** works. Without a disk, use Turso as above:
 
 | Platform | Notes |
 |---|---|
@@ -565,7 +587,7 @@ Any platform that runs a Docker image **with a persistent disk** works:
 | **Render** | Web Service → Docker, add a persistent disk at `/data`. |
 | **VPS** (Hetzner, DigitalOcean, Lightsail) | Docker Compose + Caddy for automatic HTTPS. |
 
-> **Serverless platforms (Vercel, Netlify, Lambda)** don't keep a local disk between requests, so SQLite doesn't fit there. Use a container platform, or switch the data layer to Postgres or Turso first (see the roadmap).
+> **Free tiers without a disk** (Render free, Koyeb free) wipe local files on restart. Use them only with `TURSO_DATABASE_URL` set.
 
 ### Custom short domain
 
@@ -576,7 +598,7 @@ Any platform that runs a Docker image **with a persistent disk** works:
 
 ### Backups
 
-SQLite is one file. With WAL mode you can take a consistent copy while the server is running:
+On Turso, use its point-in-time restore or `turso db shell <db> .dump`. A local SQLite database is one file, and with WAL mode you can take a consistent copy while the server is running:
 
 ```bash
 sqlite3 /data/linkforge.db ".backup '/backups/linkforge-$(date +%F).db'"
@@ -619,7 +641,7 @@ One SQLite instance will comfortably handle a personal or company shortener: mil
 |---|---|
 | Faster redirects at very high volume | Cache `code → link` in memory/Redis and write clicks to a queue in batches |
 | Huge analytics tables | Roll up clicks into hourly aggregate tables, or send them to ClickHouse |
-| Several app servers | Move to Postgres or Turso/libSQL. The SQL is portable; `db.ts` and the `db.prepare` calls are the only places to change |
+| Several app servers | Point them all at the same Turso database (already supported), or move to Postgres. The SQL is portable, and `db.ts` is the only place that talks to the driver |
 | Teams | Add `workspaces` + `memberships` tables and scope links by workspace instead of user |
 
 **Possible next features:** multiple custom domains per account, link-in-bio pages, A/B split destinations, Open Graph preview customization, scheduled reports by email, SSO, Safe Browsing checks, deep links into native apps.

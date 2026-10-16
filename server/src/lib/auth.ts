@@ -4,6 +4,7 @@ import jwt from "jsonwebtoken";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
+import { background } from "./background.js";
 import { unauthorized } from "./http.js";
 
 export interface AuthUser {
@@ -41,34 +42,31 @@ export function generateApiKey() {
 
 type UserRow = { id: string; email: string; name: string };
 
-const findUser = db.prepare<[string], UserRow>("SELECT id, email, name FROM users WHERE id = ?");
-const findKey = db.prepare<[string], UserRow & { key_id: string }>(
-  `SELECT u.id, u.email, u.name, k.id AS key_id FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = ?`,
-);
-const touchKey = db.prepare("UPDATE api_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?");
-
-function resolveToken(token: string): AuthUser | undefined {
+async function resolveToken(token: string): Promise<AuthUser | undefined> {
   if (token.startsWith(API_KEY_PREFIX)) {
-    const row = findKey.get(sha256(token));
+    const row = await db.get<UserRow & { key_id: string }>(
+      "SELECT u.id, u.email, u.name, k.id AS key_id FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = ?",
+      [sha256(token)],
+    );
     if (!row) return undefined;
-    touchKey.run(row.key_id);
+    background(db.run("UPDATE api_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?", [row.key_id]));
     return { id: row.id, email: row.email, name: row.name, via: "api_key" };
   }
   try {
     const payload = jwt.verify(token, config.jwtSecret) as { sub: string };
-    const row = findUser.get(payload.sub);
-    return row ? { ...row, via: "session" } : undefined;
+    const row = await db.get<UserRow>("SELECT id, email, name FROM users WHERE id = ?", [payload.sub]);
+    return row ? { id: row.id, email: row.email, name: row.name, via: "session" } : undefined;
   } catch {
     return undefined;
   }
 }
 
 /** Accepts `Authorization: Bearer <session JWT | API key>` or `X-API-Key: <API key>`. */
-export function requireAuth(req: Request, _res: Response, next: NextFunction) {
+export async function requireAuth(req: Request, _res: Response, next: NextFunction) {
   const header = req.get("authorization");
   const token = header?.match(/^Bearer\s+(.+)$/i)?.[1] ?? req.get("x-api-key");
   if (!token) return next(unauthorized());
-  const user = resolveToken(token.trim());
+  const user = await resolveToken(token.trim());
   if (!user) return next(unauthorized("Invalid or expired credentials"));
   req.user = user;
   next();
