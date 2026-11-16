@@ -17,17 +17,18 @@
 
 1. [Features](#features)
 2. [Quick start (local)](#quick-start-local)
-3. [How it works: the concepts](#how-it-works-the-concepts)
-4. [Architecture and project layout](#architecture-and-project-layout)
-5. [Data model](#data-model)
-6. [Using the REST API](#using-the-rest-api)
-7. [Integrating into another repo (SDK)](#integrating-into-another-repo-sdk)
-8. [Webhooks](#webhooks)
-9. [Configuration](#configuration)
-10. [Deployment](#deployment)
-11. [Testing](#testing)
-12. [Security notes](#security-notes)
-13. [Scaling and roadmap](#scaling-and-roadmap)
+3. [Integrating into your platform (steps)](#integrating-into-your-platform-steps)
+4. [How it works: the concepts](#how-it-works-the-concepts)
+5. [Architecture and project layout](#architecture-and-project-layout)
+6. [Data model](#data-model)
+7. [Using the REST API](#using-the-rest-api)
+8. [Integrating into another repo (SDK)](#integrating-into-another-repo-sdk)
+9. [Webhooks](#webhooks)
+10. [Configuration](#configuration)
+11. [Deployment](#deployment)
+12. [Testing](#testing)
+13. [Security notes](#security-notes)
+14. [Scaling and roadmap](#scaling-and-roadmap)
 
 ---
 
@@ -39,7 +40,7 @@
 | **Link controls** | **Password protection**, **expiry date**, **click limit**, **301 vs. 302** redirects, enable/disable, **tags**, title. |
 | **Device targeting** | Send iOS visitors to the App Store and Android visitors to Google Play; everyone else gets the main URL. |
 | **UTM builder** | Adds `utm_source/medium/campaign/term/content` to the destination without overwriting UTM parameters that are already there. |
-| **QR codes** | PNG or SVG in any color and size. QR scans are **counted separately** from link clicks. |
+| **QR codes** | PNG or SVG in any color and size, with your **brand logo in the centre** (high error correction, so they still scan). QR scans are **counted separately** from link clicks. |
 | **Analytics** | Total clicks, unique visitors, QR scans, change vs. the previous period, clicks over time (hour/day/week/month), referrers, countries, cities, devices, browsers, operating systems, link vs. QR, and a weekday × hour heatmap. Raw click log and **CSV export**. |
 | **Interactive dashboard** | Click any bar (a country, referrer, device...) to **filter the whole report** to it. Date-range picker, chips to show/remove filters, URL-synced state (copy the URL to share the exact view), live auto-refresh, dark mode, mobile layout, `C` shortcut to create a link. |
 | **Bulk** | Paste up to 500 URLs in the dashboard, or `POST /links/bulk`. You get a result for every item; one bad URL doesn't fail the batch. |
@@ -94,6 +95,27 @@ curl -I http://localhost:4000/hello \
 
 ---
 
+## Integrating into your platform (steps)
+
+LinkForge is API-first: another product can create, edit, delete and measure short links for its own customers without anyone opening the dashboard. The full partner guide, with every field, error, webhook payload, rate limit and a go-live checklist, is in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**. The short version:
+
+1. **Deploy** LinkForge (see [Deployment](#deployment)) and set `BASE_URL` to your short domain, e.g. `https://go.yourbrand.com`.
+2. **Add your logo** at `server/assets/qr-logo.png` so every QR code carries your brand ([details](server/assets/README.md)).
+3. **Create an API key** in the dashboard under **Developers → API keys** (one per environment). Keep it on your server only.
+4. **Create links from your backend:** `POST /api/v1/links` with `{ "url": "...", "tags": ["customer:123"] }`. Store the returned `id`; hand out `short_url`.
+5. **Edit or remove them** any time: `PATCH /api/v1/links/{id}` to change the destination or rename the back-half (`code`), `DELETE /api/v1/links/{id}` to remove it.
+6. **Serve QR codes** from `GET /api/v1/links/{id}/qr?format=png&size=512`.
+7. **Read analytics** (`/links/{id}/analytics`, `/links/{id}/clicks`, CSV) or subscribe to **webhooks** for `link.clicked`.
+8. **Handle errors and limits:** one JSON error shape, `409` for a taken back-half, `429` with `RateLimit` headers (3,000 requests/min per API key by default).
+
+```bash
+curl -X POST https://go.yourbrand.com/api/v1/links \
+  -H "Authorization: Bearer $LINKFORGE_API_KEY" -H "Content-Type: application/json" \
+  -d '{ "url": "https://yourbrand.com/offers/diwali", "custom_code": "diwali", "tags": ["campaign:diwali"] }'
+```
+
+---
+
 ## How it works: the concepts
 
 ### 1. What a URL shortener does
@@ -144,6 +166,7 @@ LinkForge sends `Cache-Control: private, no-store` on 302s so analytics stay acc
 | `ts` | Server time (UTC, ISO-8601) |
 | `referrer_domain` | Hostname of the `Referer` header, without `www.`. No header means **Direct** (typed in, from an app, from email, etc.). |
 | `country`, `city` | First from CDN/host headers (`CF-IPCountry`, `X-Vercel-IP-Country`, `Fly-Client-Country`...), then from the optional local `geoip-lite` database |
+| `latitude`, `longitude` | **Approximate** (city centre, rounded to ~1 km) from `X-Vercel-IP-Latitude/Longitude`, Cloudflare's `CF-IPLatitude/Longitude`, or `geoip-lite`. `null` when unknown. Never GPS: exact location would need the visitor's browser permission on an extra page before every redirect. |
 | `device`, `browser`, `os` | Parsed from the `User-Agent` with `ua-parser-js` |
 | `source` | `qr` if the visit came from the QR code (the QR image encodes `/<code>?qr=1`), otherwise `link` |
 | `is_bot` | User-agent matches known crawlers and link unfurlers (Slackbot, Twitterbot, facebookexternalhit, curl...) or is empty |
@@ -284,6 +307,8 @@ erDiagram
             text referrer_domain
             text country
             text city
+            real latitude "approximate"
+            real longitude "approximate"
             text device
             text browser
             text os
@@ -316,7 +341,7 @@ erDiagram
 | `GET` | `/links/{id}` | Get one link |
 | `PATCH` | `/links/{id}` | Update any field; send `null` to clear an optional one |
 | `DELETE` | `/links/{id}` | Delete a link and its clicks |
-| `GET` | `/links/{id}/qr` | QR code: `format=png\|svg`, `size`, `color`, `bg`, `download=1` |
+| `GET` | `/links/{id}/qr` | QR code: `format=png\|svg`, `size`, `color`, `bg`, `download=1`, `logo=0` to leave out the brand logo |
 | `GET` | `/links/{id}/analytics` | Full report for one link |
 | `GET` | `/links/{id}/clicks` | Raw click log, newest first, paginated |
 | `GET` | `/links/{id}/clicks.csv` | Every click as CSV |
@@ -397,7 +422,7 @@ Every error has the same shape:
 | 401 | `unauthorized` | Missing or invalid key |
 | 404 | `not_found` | Unknown link, or a link you don't own |
 | 409 | `conflict` | Back-half already taken |
-| 429 | | Rate limited (300 req/min per IP on the API; standard `RateLimit` headers) |
+| 429 | | Rate limited: 3,000 req/min per API key, 300 req/min per IP for calls without a key (both configurable). Standard `RateLimit` headers |
 
 ---
 
@@ -480,7 +505,7 @@ X-LinkForge-Signature: sha256=<hex HMAC-SHA256 of the raw body, keyed with the w
   "created_at": "2026-10-16T06:22:04.595Z",
   "data": {
     "link":  { "id": "...", "code": "launch", "short_url": "...", "long_url": "..." },
-    "click": { "ts": "...", "country": "US", "city": "Austin", "device": "mobile",
+    "click": { "ts": "...", "country": "US", "city": "Austin", "latitude": 30.27, "longitude": -97.74, "device": "mobile",
                "browser": "Mobile Safari", "os": "iOS", "referrer": "t.co", "source": "link" }
   }
 }
@@ -520,6 +545,9 @@ All settings are environment variables (see `server/.env.example`).
 | `IP_HASH_SALT` | `JWT_SECRET` | Salt for visitor hashes |
 | `TRUST_PROXY` | `0` (`1` on Vercel) | Set to `1` behind a load balancer or reverse proxy so the real client IP is used |
 | `CODE_LENGTH` | `7` | Length of generated codes |
+| `API_KEY_RATE_LIMIT` | `3000` | API requests per minute per API key |
+| `API_RATE_LIMIT` | `300` | API requests per minute per IP, for calls without an API key |
+| `QR_LOGO_PATH` | `server/assets/qr-logo.png` | Logo drawn in the centre of every QR code. No file = plain QR codes |
 | `WEB_DIST` | `../web/dist` | Where the built dashboard lives |
 
 **Better geolocation:** if your host doesn't add a country header (Cloudflare, Vercel and Fly.io do), run `npm i geoip-lite -w server` to look up country and city locally. It is loaded automatically when installed (~100 MB of data).
@@ -639,7 +667,7 @@ One SQLite instance will comfortably handle a personal or company shortener: mil
 
 | Need | Approach |
 |---|---|
-| Faster redirects at very high volume | Cache `code → link` in memory/Redis and write clicks to a queue in batches |
+| Faster redirects at very high volume | Redirects already don't wait for the click write. Next: cache `code → link` in memory/Redis and write clicks to a queue in batches |
 | Huge analytics tables | Roll up clicks into hourly aggregate tables, or send them to ClickHouse |
 | Several app servers | Point them all at the same Turso database (already supported), or move to Postgres. The SQL is portable, and `db.ts` is the only place that talks to the driver |
 | Teams | Add `workspaces` + `memberships` tables and scope links by workspace instead of user |
