@@ -76,6 +76,11 @@ const migrations: string[] = [
   );
   CREATE INDEX idx_webhooks_user ON webhooks(user_id);
   `,
+  // 2: approximate (city-level) visitor coordinates, from hosting-platform headers or the optional IP database.
+  `
+  ALTER TABLE clicks ADD COLUMN latitude REAL;
+  ALTER TABLE clicks ADD COLUMN longitude REAL;
+  `,
 ];
 
 /**
@@ -102,6 +107,8 @@ const split = (sql: string) =>
 async function migrate() {
   if (config.databaseUrl !== ":memory:" && !/^(libsql|https?|wss?):/.test(config.databaseUrl)) {
     await client.execute("PRAGMA journal_mode = WAL");
+    // Wait up to 5s for a competing writer instead of failing with SQLITE_BUSY under bursts of clicks.
+    await client.execute("PRAGMA busy_timeout = 5000");
   }
   await client.execute("PRAGMA foreign_keys = ON");
   await client.execute("CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)");

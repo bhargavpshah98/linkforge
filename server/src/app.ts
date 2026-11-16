@@ -1,12 +1,12 @@
 import cors from "cors";
 import express from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import helmet from "helmet";
 import fs from "node:fs";
 import path from "node:path";
 import swaggerUi from "swagger-ui-express";
 import { config } from "./config.js";
-import { requireAuth } from "./lib/auth.js";
+import { API_KEY_PREFIX, requireAuth, sha256 } from "./lib/auth.js";
 import { errorHandler, notFound } from "./lib/http.js";
 import { openapi } from "./openapi.js";
 import { authRouter } from "./routes/auth.js";
@@ -27,8 +27,25 @@ export function createApp() {
   const api = express.Router();
   // The API is meant to be called from other apps, so any origin may call it (auth is via bearer token, not cookies).
   api.use(cors({ origin: true, exposedHeaders: ["RateLimit", "RateLimit-Policy"] }));
+  // Integrations call from a few server IPs, so requests made with an API key are limited per key
+  // (API_KEY_RATE_LIMIT), everything else per client IP (API_RATE_LIMIT). Counters live in memory,
+  // so with several instances each one enforces the limit separately.
+  const apiKeyOf = (req: express.Request) => {
+    const token = req.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? req.get("x-api-key");
+    return token?.trim().startsWith(API_KEY_PREFIX) ? token.trim() : undefined;
+  };
   api.use(
-    rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: "draft-8", legacyHeaders: false, skip: () => config.env === "test" }),
+    rateLimit({
+      windowMs: 60_000,
+      limit: (req) => (apiKeyOf(req) ? config.apiKeyRateLimit : config.apiRateLimit),
+      keyGenerator: (req) => {
+        const key = apiKeyOf(req);
+        return key ? `key:${sha256(key)}` : `ip:${ipKeyGenerator(req.ip ?? "")}`;
+      },
+      standardHeaders: "draft-8",
+      legacyHeaders: false,
+      skip: () => config.env === "test",
+    }),
   );
   api.get("/health", (_req, res) => {
     res.json({ ok: true, time: new Date().toISOString() });

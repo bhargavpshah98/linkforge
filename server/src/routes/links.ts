@@ -1,11 +1,11 @@
 import { Router, type Request } from "express";
-import QRCode from "qrcode";
 import { z } from "zod";
 import { db } from "../db.js";
 import { fullReport, rangeSchema, resolveRange, topLinks, type Scope } from "../lib/analytics.js";
 import { hashPassword } from "../lib/auth.js";
 import { background } from "../lib/background.js";
 import { notFound } from "../lib/http.js";
+import { renderQr } from "../lib/qr.js";
 import {
   applyUtm,
   assertCodeAvailable,
@@ -191,17 +191,14 @@ linksRouter.get("/links/:id/qr", async (req, res) => {
       color: z.string().regex(/^[0-9a-fA-F]{6}$/).default("111827"),
       bg: z.string().regex(/^[0-9a-fA-F]{6}$/).default("ffffff"),
       download: z.enum(["1", "0"]).optional(),
+      logo: z.enum(["1", "0"]).default("1"),
     })
     .parse(req.query);
   // `?qr=1` lets the redirect handler attribute scans separately from link clicks.
   const target = `${shortUrl(link.code)}?qr=1`;
-  const opts = { margin: 2, width: q.size, color: { dark: `#${q.color}`, light: `#${q.bg}` }, errorCorrectionLevel: "M" as const };
+  const image = await renderQr(target, { format: q.format, size: q.size, color: q.color, bg: q.bg, logo: q.logo === "1" });
   if (q.download === "1") res.setHeader("content-disposition", `attachment; filename="${link.code}-qr.${q.format}"`);
-  if (q.format === "svg") {
-    res.type("image/svg+xml").send(await QRCode.toString(target, { ...opts, type: "svg" }));
-  } else {
-    res.type("image/png").send(await QRCode.toBuffer(target, opts));
-  }
+  res.type(q.format === "svg" ? "image/svg+xml" : "image/png").send(image);
 });
 
 // ---- Analytics ----
@@ -219,7 +216,7 @@ linksRouter.get("/links/:id/analytics", async (req, res) => {
   res.json({ link: serializeLink(link), ...(await fullReport(scope, interval, tzOffset)) });
 });
 
-const CLICK_COLUMNS = "ts, referrer, referrer_domain, country, city, device, browser, os, source, is_bot";
+const CLICK_COLUMNS = "ts, referrer, referrer_domain, country, city, latitude, longitude, device, browser, os, source, is_bot";
 
 linksRouter.get("/links/:id/clicks", async (req, res) => {
   const link = await ownedLink(req);
@@ -248,7 +245,7 @@ linksRouter.get("/links/:id/clicks.csv", async (req, res) => {
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   res.type("text/csv").setHeader("content-disposition", `attachment; filename="${link.code}-clicks.csv"`);
-  res.write(CLICK_COLUMNS + "\n");
+  res.write(CLICK_COLUMNS.split(", ").join(",") + "\n");
   // Page through the click log so very large exports don't load into memory at once.
   const PAGE = 5000;
   for (let offset = 0; ; offset += PAGE) {
