@@ -72,35 +72,52 @@ async function recordAndRedirect(req: Request, res: Response, link: LinkRow) {
     referrer_domain: info.referrerDomain,
     country: info.country,
     city: info.city,
+    latitude: info.latitude,
+    longitude: info.longitude,
     device: info.device,
     browser: info.browser,
     os: info.os,
     source,
     is_bot: Number(info.isBot),
   };
-  await db.batch([
-    {
-      sql: `INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, device, browser, os, source, is_bot)
-            VALUES (@link_id, @ts, @visitor_hash, @referrer, @referrer_domain, @country, @city, @device, @browser, @os, @source, @is_bot)`,
-      args: click,
-    },
-    // Bots are stored for transparency but don't count toward totals or click limits.
-    ...(info.isBot ? [] : [{ sql: "UPDATE links SET total_clicks = total_clicks + 1, last_clicked_at = ? WHERE id = ?", args: [ts, link.id] }]),
-  ]);
 
-  if (!info.isBot) {
-    background(
-      emit(link.user_id, "link.clicked", {
-        link: { id: link.id, code: link.code, short_url: shortUrl(link.code), long_url: link.long_url },
-        click: { ts, country: info.country, city: info.city, device: info.device, browser: info.browser, os: info.os, referrer: info.referrerDomain, source },
-      }),
-    );
-  }
-
+  // Send the visitor on first. Recording the click happens afterwards, so a slow or failing database
+  // costs one analytics row at worst and never a redirect.
   // 302s are never cached by browsers, so every visit is counted. 301s may be cached (better for SEO, worse for analytics).
   res.setHeader("cache-control", link.redirect_type === 301 ? "public, max-age=300" : "private, no-store");
   // After the password form (a POST) use 303 so the browser follows with a GET.
   res.redirect(req.method === "POST" ? 303 : link.redirect_type, destinationFor(link, info.os));
+
+  background(
+    db
+      .batch([
+        {
+          sql: `INSERT INTO clicks (link_id, ts, visitor_hash, referrer, referrer_domain, country, city, latitude, longitude, device, browser, os, source, is_bot)
+                VALUES (@link_id, @ts, @visitor_hash, @referrer, @referrer_domain, @country, @city, @latitude, @longitude, @device, @browser, @os, @source, @is_bot)`,
+          args: click,
+        },
+        // Bots are stored for transparency but don't count toward totals or click limits.
+        ...(info.isBot ? [] : [{ sql: "UPDATE links SET total_clicks = total_clicks + 1, last_clicked_at = ? WHERE id = ?", args: [ts, link.id] }]),
+      ])
+      .then(() => {
+        if (info.isBot) return;
+        return emit(link.user_id, "link.clicked", {
+          link: { id: link.id, code: link.code, short_url: shortUrl(link.code), long_url: link.long_url },
+          click: {
+            ts,
+            country: info.country,
+            city: info.city,
+            latitude: info.latitude,
+            longitude: info.longitude,
+            device: info.device,
+            browser: info.browser,
+            os: info.os,
+            referrer: info.referrerDomain,
+            source,
+          },
+        });
+      }),
+  );
 }
 
 async function lookup(req: Request) {

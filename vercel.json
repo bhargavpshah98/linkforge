@@ -6,15 +6,30 @@
   "outputDirectory": "web/dist",
   "functions": {
     "api/index.js": {
-      "includeFiles": "node_modules/swagger-ui-dist/**",
+      "includeFiles": "{node_modules/swagger-ui-dist/**,server/assets/**}",
       "maxDuration": 30
     }
   },
   "rewrites": [
-    { "source": "/app", "destination": "/index.html" },
-    { "source": "/app/:path*", "destination": "/index.html" },
-    { "source": "/login", "destination": "/index.html" },
-    { "source": "/register", "destination": "/index.html" },
-    { "source": "/:path*", "destination": "/api/index" }
+    {
+      "source": "/app",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/app/:path*",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/login",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/register",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/:path*",
+      "destination": "/api/index"
+    }
   ]
 }

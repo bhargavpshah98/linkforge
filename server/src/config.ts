@@ -23,6 +23,11 @@ export const config = {
   ipHashSalt: env.IP_HASH_SALT ?? env.JWT_SECRET ?? "dev-only-salt",
   trustProxy: env.TRUST_PROXY === "1" || env.TRUST_PROXY === "true" || Boolean(env.VERCEL),
   codeLength: Number(env.CODE_LENGTH ?? 7),
+  // API requests per minute: per API key for integrations, per IP for everything else.
+  apiKeyRateLimit: Number(env.API_KEY_RATE_LIMIT ?? 3000),
+  apiRateLimit: Number(env.API_RATE_LIMIT ?? 300),
+  // Brand logo drawn in the middle of every QR code. Drop a PNG/JPG/SVG at server/assets/qr-logo.png or point QR_LOGO_PATH at one.
+  qrLogoPath: env.QR_LOGO_PATH ?? new URL("../assets/qr-logo.png", import.meta.url).pathname,
   // Directory of the built dashboard. When it exists the server serves it, so one process runs everything.
   webDist: env.WEB_DIST ?? new URL("../../web/dist", import.meta.url).pathname,
 };

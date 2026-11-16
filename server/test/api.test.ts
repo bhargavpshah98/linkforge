@@ -1,6 +1,7 @@
 import request from "supertest";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
+import { settle } from "../src/lib/background.js";
 
 const app = createApp();
 const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1";
@@ -52,6 +53,7 @@ describe("links", () => {
     const hit = await request(app).get(`/${created.body.code}`).set("user-agent", MAC).set("referer", "https://www.linkedin.com/feed").set("cf-ipcountry", "DE");
     expect(hit.status).toBe(302);
     expect(hit.headers.location).toBe("https://example.com/a/very/long/path");
+    await settle();
 
     const clicks = await request(app).get(`/api/v1/links/${created.body.id}/clicks`).set(auth());
     expect(clicks.body.data[0]).toMatchObject({ referrer_domain: "linkedin.com", country: "DE", device: "desktop", browser: "Chrome", os: "macOS", source: "link" });
@@ -102,12 +104,14 @@ describe("links", () => {
 
     const limited = await request(app).post("/api/v1/links").set(auth()).send({ url: "https://example.com", max_clicks: 1 });
     expect((await request(app).get(`/${limited.body.code}`).set("user-agent", MAC)).status).toBe(302);
+    await settle();
     expect((await request(app).get(`/${limited.body.code}`).set("user-agent", MAC)).status).toBe(410);
   });
 
   it("does not count bots toward totals", async () => {
     const res = await request(app).post("/api/v1/links").set(auth()).send({ url: "https://example.com/bots" });
     await request(app).get(`/${res.body.code}`).set("user-agent", "Twitterbot/1.0");
+    await settle();
     expect((await request(app).get(`/api/v1/links/${res.body.id}`).set(auth())).body.total_clicks).toBe(0);
   });
 
@@ -160,6 +164,7 @@ describe("analytics", () => {
     await request(app).get(`/${link.body.code}`).set("user-agent", IPHONE).set("cf-ipcountry", "IN");
     await request(app).get(`/${link.body.code}`).set("user-agent", IPHONE).set("cf-ipcountry", "IN");
     await request(app).get(`/${link.body.code}?qr=1`).set("user-agent", MAC).set("cf-ipcountry", "US").set("referer", "https://t.co/x");
+    await settle();
 
     const res = await request(app).get(`/api/v1/links/${link.body.id}/analytics`).set(auth());
     expect(res.status).toBe(200);
